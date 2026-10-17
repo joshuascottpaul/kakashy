@@ -1,0 +1,124 @@
+#!/usr/bin/env python3
+"""kakashy: local full-page screenshots from Safari. No cloud API, no LLM, stdlib only.
+
+Opens its own new Safari window (so your logged-in cookies apply, and your own tabs
+are never touched), scrolls the page's real scroll container, captures each screen,
+and stitches the frames into one tall PNG.
+"""
+import argparse, json, os, subprocess, sys, tempfile, time
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+CACHE = os.path.expanduser("~/.cache/kakashy")
+
+
+def osa(script):
+    return subprocess.run(["osascript", "-e", script], capture_output=True, text=True).stdout.strip()
+
+
+def js(wid, code):
+    code = " ".join(code.split()).replace("\\", "\\\\").replace('"', '\\"')
+    return osa(f'tell application "Safari" to do JavaScript "{code}" in current tab of window id {wid}')
+
+
+def window_ids():
+    return set(osa('tell application "Safari" to get id of every window').replace(" ", "").split(","))
+
+
+def stitcher():
+    """Compile stitch.swift once into ~/.cache/kakashy (needs Xcode command line tools)."""
+    os.makedirs(CACHE, exist_ok=True)
+    exe, src = os.path.join(CACHE, "stitch"), os.path.join(HERE, "stitch.swift")
+    if not os.path.exists(exe) or os.path.getmtime(exe) < os.path.getmtime(src):
+        print("compiling stitcher (first run)...", file=sys.stderr)
+        subprocess.run(["swiftc", "-O", src, "-o", exe], check=True)
+    return exe
+
+
+FIND_SCROLLER = """(function(){
+  var best=null,bh=0;
+  document.querySelectorAll('*').forEach(function(e){var s=getComputedStyle(e);
+    if((s.overflowY=='auto'||s.overflowY=='scroll')&&e.scrollHeight>e.clientHeight&&e.scrollHeight>bh){best=e;bh=e.scrollHeight}});
+  if(!best||document.scrollingElement.scrollHeight>bh){best=document.scrollingElement}
+  document.querySelectorAll('*').forEach(function(e){var p=getComputedStyle(e).position;
+    if((p=='fixed'||p=='sticky')&&!e.contains(best)&&!best.contains(e)){e.style.visibility='hidden'}});
+  best.id='__kakashy'; best.scrollTop=0;
+  var r=best===document.scrollingElement?{top:0,left:0,width:window.innerWidth}:best.getBoundingClientRect();
+  return JSON.stringify({ch:best.clientHeight,top:r.top,left:r.left,width:r.width,
+    chrome:window.outerHeight-window.innerHeight,dpr:window.devicePixelRatio});})()"""
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Full-page screenshot of a URL in Safari (your logged-in session).")
+    ap.add_argument("url")
+    ap.add_argument("out", help="output PNG path")
+    ap.add_argument("--hide", action="append", default=[], metavar="CSS",
+                    help="CSS selector to hide before capture (repeatable), e.g. a chat composer")
+    ap.add_argument("--width", type=int, default=1300, help="window width in points (default 1300)")
+    ap.add_argument("--keep-frames", action="store_true", help="keep the raw frames next to the output")
+    a = ap.parse_args()
+    out = os.path.abspath(a.out)
+    exe = stitcher()
+
+    before = window_ids()
+    osa(f'tell application "Safari" to make new document with properties {{URL:"{a.url}"}}')
+    time.sleep(1)
+    new = window_ids() - before
+    if len(new) != 1:
+        sys.exit(f"could not identify the new window: {new}")
+    wid = new.pop()
+    frames_dir = tempfile.mkdtemp(prefix="kakashy-")
+    try:
+        osa(f'tell application "Safari" to set bounds of window id {wid} to {{60, 40, {60 + a.width}, 1000}}')
+        for _ in range(60):
+            time.sleep(1)
+            if js(wid, "document.readyState") == "complete":
+                break
+        time.sleep(2)
+        for sel in a.hide:
+            js(wid, f"document.querySelectorAll({json.dumps(sel)}).forEach(function(e){{e.style.display='none'}});'ok'")
+        time.sleep(0.5)
+        info = json.loads(js(wid, FIND_SCROLLER))
+        # lazy-loaded content: go to the top until the height stops growing
+        last, stable = -1, 0
+        for _ in range(40):
+            js(wid, "document.getElementById('__kakashy').scrollTop=0")
+            time.sleep(1.5)
+            cur = int(float(js(wid, "document.getElementById('__kakashy').scrollHeight")))
+            stable = stable + 1 if cur == last else 0
+            last = cur
+            if stable >= 3:
+                break
+        sh, ch, dpr = last, info["ch"], info["dpr"]
+        crop_top = int(round((info["chrome"] + info["top"]) * dpr))
+        frames, y = [], 0
+        while len(frames) < 400:
+            js(wid, f"document.getElementById('__kakashy').scrollTop={y}")
+            time.sleep(0.7)
+            actual = int(float(js(wid, "document.getElementById('__kakashy').scrollTop")))
+            f = os.path.join(frames_dir, f"frame_{len(frames):03d}.png")
+            r = subprocess.run(["screencapture", "-l", str(wid), "-o", "-x", f], capture_output=True, text=True)
+            if r.returncode != 0 or not os.path.exists(f):
+                sys.exit("screencapture failed. Grant Screen Recording to your terminal app. " + r.stderr)
+            if frames and actual * dpr == frames[-1][1]:
+                os.remove(f)
+                break
+            frames.append((f, int(actual * dpr)))
+            if actual + ch >= sh - 1:
+                break
+            y = actual + ch - 40
+        cmd = [exe, out, str(int(sh * dpr)), str(crop_top), str(int(info["left"] * dpr)),
+               str(int(info["width"] * dpr)), str(int(ch * dpr))] + [f"{f}:{o}" for f, o in frames]
+        subprocess.run(cmd, check=True)
+        print(f"{out}  ({len(frames)} frames, {sh}pt tall)")
+    finally:
+        osa(f'tell application "Safari" to close window id {wid}')
+        if a.keep_frames:
+            print("frames kept in", frames_dir)
+        else:
+            for n in os.listdir(frames_dir):
+                os.remove(os.path.join(frames_dir, n))
+            os.rmdir(frames_dir)
+
+
+if __name__ == "__main__":
+    main()
